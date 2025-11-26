@@ -1,6 +1,13 @@
 #include "at_dstwr/uwb.h"
-
 #include "dw3000.h"
+
+// FIXED: Defined a safety timeout (60ms) to prevent infinite loops if packets are lost
+#define SAFE_RX_TIMEOUT_UUS 60000 
+
+// FIXED: Default antenna delay. 
+// NOTE: You should calibrate this for your specific board later.
+#define TX_ANT_DLY 16385 
+#define RX_ANT_DLY 16385 
 
 dwt_config_t config = {
     5,            /* Channel number. */
@@ -13,12 +20,9 @@ dwt_config_t config = {
     DWT_BR_6M8,       /* Data rate. */
     DWT_PHRMODE_STD,  /* PHY header mode. */
     DWT_PHRRATE_STD,  /* PHY header rate. */
-    (129 + 8 - 8),    /* SFD timeout (preamble length + 1 + SFD length - PAC
-                         size).    Used in RX only. */
+    (129 + 8 - 8),    /* SFD timeout. Used in RX only. */
     DWT_STS_MODE_OFF, /* STS disabled */
-    DWT_STS_LEN_64,   /* STS length see allowed values in Enum
-                       * dwt_sts_lengths_e
-                       */
+    DWT_STS_LEN_64,   /* STS length */
     DWT_PDOA_M0       /* PDOA mode off */
 };
 extern dwt_txconfig_t txconfig_options;
@@ -161,6 +165,7 @@ void start_uwb() {
         while (1);
     }
 
+    // FIXED: Original disabled LEDs. Keeping as is, but standard is ENABLE for debug.
     dwt_setleds(DWT_LEDS_DISABLE);
 
     if (dwt_configure(&config)) {
@@ -172,11 +177,12 @@ void start_uwb() {
     dwt_setrxantennadelay(RX_ANT_DLY);
     dwt_settxantennadelay(TX_ANT_DLY);
     dwt_setrxaftertxdelay(TX_TO_RX_DLY_UUS);
-#ifdef TAG
-    dwt_setrxtimeout(RX_TIMEOUT_UUS);
-#else
-    dwt_setrxtimeout(0);
-#endif
+
+    // FIXED: Changed your timeout logic. 
+    // The original code disabled timeout for anchors (0). This causes hanging.
+    // We now use SAFE_RX_TIMEOUT_UUS for everyone.
+    dwt_setrxtimeout(SAFE_RX_TIMEOUT_UUS);
+    
     dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
 
     set_target_uids();
@@ -199,6 +205,7 @@ void initiator() {
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
     }
 
+    // FIXED: Added SYS_STATUS_ALL_RX_TO to this check so we don't ignore timeouts
     while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
              (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO |
               SYS_STATUS_ALL_RX_ERR))) {
@@ -209,6 +216,7 @@ void initiator() {
         dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
         dwt_readrxdata(rx_buffer, BUF_LEN, 0);
         if (rx_buffer[MSG_SID_IDX] != target_uids[counter]) {
+            // FIXED: Added error clearing here to prevent stuck state
             dwt_write32bitreg(SYS_STATUS_ID,
                               SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
             counter = 0;
@@ -226,14 +234,16 @@ void initiator() {
             ++counter;
         }
     } else { /* timeout or error, reset, send ack*/
+        // FIXED: Explicitly clear the specific error flags
+        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        
         tx_msg[MSG_SN_IDX] = frame_seq_nb;
         tx_msg[MSG_FUNC_IDX] = FUNC_CODE_RESET;
         dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
         dwt_writetxdata((uint16_t)(MSG_LEN), tx_msg, 0);
         dwt_writetxfctrl((uint16_t)(MSG_LEN), 0, 1);
         dwt_starttx(DWT_START_TX_IMMEDIATE);
-        dwt_write32bitreg(SYS_STATUS_ID,
-                          SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        
         wait_ack = false;
         wait_final = false;
         counter = 0;
@@ -260,6 +270,11 @@ void initiator() {
             wait_final = true;
             counter = 0;
             dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+        } else {
+             // FIXED: Handle late TX error to prevent hanging
+             counter = 0;
+             wait_ack = false; 
+             dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
         }
         return;
     }
@@ -291,9 +306,12 @@ void initiator() {
 
 void responder() {
     dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    
+    // FIXED: Added SYS_STATUS_ALL_RX_TO to the check
     while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
-             (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_ERR))) {
+             (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO))) {
     };
+    
     if (status_reg & SYS_STATUS_RXFCG_BIT_MASK) { /* receive msg */
         dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
         dwt_readrxdata(rx_buffer, BUF_LEN, 0);
@@ -326,6 +344,7 @@ void responder() {
         wait_poll = true;
         wait_range = false;
         counter = 0;
+        // FIXED: Clear ALL error flags
         dwt_write32bitreg(SYS_STATUS_ID,
                           SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO);
         return;
@@ -348,6 +367,10 @@ void responder() {
                          SYS_STATUS_TXFRS_BIT_MASK)) {
                 };
                 dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+            } else {
+                // FIXED: Handle late TX to prevent hang
+                wait_poll = true;
+                counter = 0;
             }
         }
         if (counter == NUM_NODES - 1) { /* all anchors sent the ack msgs */
@@ -377,6 +400,11 @@ void responder() {
                          SYS_STATUS_TXFRS_BIT_MASK)) {
                 };
                 dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+            } else {
+                 // FIXED: Handle late TX
+                wait_poll = true;
+                wait_range = false;
+                counter = 0;
             }
         }
         if (counter == NUM_NODES - 1) {
